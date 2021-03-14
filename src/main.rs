@@ -1,27 +1,33 @@
-use opencv::{
-    core,
-    highgui,
-    prelude::*,
-    videoio,
-};
+use opencv::{highgui, prelude::*, types::VectorOfu8};
 
-fn run() -> opencv::Result<()> {
+mod connection;
+use connection::{Command, Connection, LoginMessage};
+
+fn run() -> anyhow::Result<()> {
+    let mut connection = Connection::connect(
+        "127.0.0.1:11000",
+        &LoginMessage {
+            name: "Team Rust",
+            color: "#ff9514",
+            team_id: "rust",
+        },
+    )?;
+
     let window = "video capture";
     highgui::named_window(window, 1)?;
-    #[cfg(feature = "opencv-32")]
-    let mut cam = videoio::VideoCapture::new_default(0)?;  // 0 is the default camera
-    #[cfg(not(feature = "opencv-32"))]
-    let mut cam = videoio::VideoCapture::new(0, videoio::CAP_ANY)?;  // 0 is the default camera
-    let opened = videoio::VideoCapture::is_opened(&cam)?;
-    if !opened {
-        panic!("Unable to open default camera!");
-    }
+
     loop {
-        let mut frame = core::Mat::default()?;
-        cam.read(&mut frame)?;
+        let image = connection.read_next_image()?;
+
+        let mut frame =
+            opencv::imgcodecs::imdecode(&VectorOfu8::from(image), opencv::imgcodecs::IMREAD_COLOR)?;
+
+        connection.send(&Command::Forward { value: 0.15 })?;
+
         if frame.size()?.width > 0 {
             highgui::imshow(window, &mut frame)?;
         }
+
         let key = highgui::wait_key(10)?;
         if key > 0 && key != 255 {
             break;
