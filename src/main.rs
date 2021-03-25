@@ -1,5 +1,8 @@
 use opencv::{
-    core::{bitwise_and, normalize, split, Point_, Size, BORDER_CONSTANT, NORM_MINMAX},
+    core::{
+        bitwise_and, count_non_zero, normalize, split, Point_, Rect_, Size, BORDER_CONSTANT,
+        NORM_MINMAX,
+    },
     highgui, imgcodecs,
     imgproc::{
         cvt_color, erode, get_structuring_element, morphology_default_border_value, threshold,
@@ -12,12 +15,18 @@ use opencv::{
 mod connection;
 use connection::{Command, Connection, LoginMessage};
 
+const DEBUG_SAVE_IMAGES: bool = false;
+
 fn save_frame(mat: &Mat, i: usize) -> anyhow::Result<()> {
     let image_name = format!("captures/frame{:04}.png", i);
     save_frame_to_file(&image_name, mat)
 }
 
 fn save_frame_to_file(name: &str, mat: &Mat) -> anyhow::Result<()> {
+    if !DEBUG_SAVE_IMAGES {
+        return Ok(());
+    }
+
     imgcodecs::imwrite(&name, &mat, &opencv::core::Vector::<i32>::new())?;
     Ok(())
 }
@@ -38,6 +47,10 @@ fn run() -> anyhow::Result<()> {
     highgui::named_window(window, 1)?;
 
     let mut frame_i = 0;
+    let mut car_state = CarState {
+        speed: 0.0,
+        wheels_turn: 0.0,
+    };
 
     loop {
         let image = connection.read_next_image()?;
@@ -46,7 +59,7 @@ fn run() -> anyhow::Result<()> {
             opencv::imgcodecs::imdecode(&VectorOfu8::from(image), opencv::imgcodecs::IMREAD_COLOR)?;
 
         save_frame(&frame, frame_i)?;
-        process_frame(&frame)?;
+        frame_update(&frame, &mut car_state, &mut &mut connection)?;
 
         connection.send(&Command::Forward { value: 0.15 })?;
 
@@ -61,6 +74,89 @@ fn run() -> anyhow::Result<()> {
 
         frame_i += 1;
     }
+    Ok(())
+}
+
+struct CarState {
+    wheels_turn: f32,
+    speed: f32,
+}
+
+fn frame_update(
+    frame: &Mat,
+    state: &mut CarState,
+    connection: &mut Connection,
+) -> anyhow::Result<()> {
+    let wheels_turn = &mut state.wheels_turn;
+    let speed = &mut state.speed;
+
+    let frames = process_frame(frame)?;
+
+    let blue_roi = Mat::roi(
+        &frames.get(0).unwrap().1,
+        Rect_ {
+            x: 32,
+            y: 20,
+            width: 64,
+            height: 60,
+        },
+    )
+    .ok()
+    .unwrap();
+    save_frame_to_file("captures/debug/blue-roi.png", &blue_roi)?;
+    let blue_count = count_non_zero(&blue_roi).unwrap() as f32;
+
+    // calc the green frame and if we should move left
+    let green_roi = Mat::roi(
+        &frames.get(1).unwrap().2,
+        Rect_ {
+            x: 64,
+            y: 20,
+            width: 64,
+            height: 60,
+        },
+    )
+    .ok()
+    .unwrap();
+    save_frame_to_file("captures/debug/green-roi.png", &green_roi)?;
+    let green_count = count_non_zero(&green_roi).unwrap() as f32;
+
+    // calc the red frame and if we should move right
+    let red_roi = Mat::roi(
+        &frames.get(2).unwrap().3,
+        Rect_ {
+            x: 0,
+            y: 20,
+            width: 64,
+            height: 60,
+        },
+    )
+    .ok()
+    .unwrap();
+    save_frame_to_file("captures/debug/red-roi.png", &red_roi)?;
+    let red_count = count_non_zero(&red_roi).unwrap() as f32;
+
+    let red_ratio = red_count / (64.0 * 60.0);
+    let green_ratio = green_count / (64.0 * 60.0);
+    let blue_ratio = blue_count / (64.0 * 60.0);
+
+    let diff = red_ratio - green_ratio;
+    if blue_ratio < 0.6 {
+        *wheels_turn = (*wheels_turn - diff * 2.0f32).max(-0.9f32).min(0.9f32);
+    }
+    let max_speed = 0.15;
+    let min_speed = 0.06;
+    *speed = (0.01 / wheels_turn.abs().max(0.01))
+        .min(max_speed)
+        .max(min_speed);
+
+    connection.send(&Command::Forward { value: *speed })?;
+    connection.send(&Command::Turn {
+        value: *wheels_turn,
+    })?;
+
+    *wheels_turn *= 0.3;
+
     Ok(())
 }
 
