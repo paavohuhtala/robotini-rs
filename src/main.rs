@@ -37,12 +37,15 @@ fn save_frame_to_file(name: &str, mat: &Mat) -> anyhow::Result<()> {
 fn run() -> anyhow::Result<()> {
     std::fs::create_dir_all("captures/debug")?;
 
+    let team_id = std::env::var("teamid").unwrap_or(String::from("rust"));
+    let address = std::env::var("SIMULATOR").unwrap_or(String::from("127.0.0.1:11000"));
+
     let mut connection = Connection::connect(
-        "127.0.0.1:11000",
+        &address,
         &LoginMessage {
             name: "Team Rust",
             color: "#ff9514",
-            team_id: "rust",
+            team_id: &team_id,
         },
     )?;
 
