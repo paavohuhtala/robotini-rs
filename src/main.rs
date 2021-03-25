@@ -1,12 +1,14 @@
+use std::collections::VecDeque;
+
 use opencv::{
     core::{
-        bitwise_and, count_non_zero, normalize, split, Point_, Rect_, Size, BORDER_CONSTANT,
-        NORM_MINMAX,
+        bitwise_and, count_non_zero, normalize, split, Point_, Rect_, Scalar_, Size,
+        BORDER_CONSTANT, NORM_MINMAX,
     },
     highgui, imgcodecs,
     imgproc::{
         cvt_color, erode, get_structuring_element, morphology_default_border_value, threshold,
-        COLOR_BGR2GRAY, MORPH_RECT, THRESH_BINARY,
+        COLOR_BGR2GRAY, LINE_8, MORPH_RECT, THRESH_BINARY,
     },
     prelude::*,
     types::{VectorOfMat, VectorOfu8},
@@ -16,6 +18,7 @@ mod connection;
 use connection::{Command, Connection, LoginMessage};
 
 const DEBUG_SAVE_IMAGES: bool = false;
+const DEBUG_GUI: bool = false;
 
 fn save_frame(mat: &Mat, i: usize) -> anyhow::Result<()> {
     let image_name = format!("captures/frame{:04}.png", i);
@@ -43,19 +46,22 @@ fn run() -> anyhow::Result<()> {
         },
     )?;
 
-    let window = "video capture";
-    highgui::named_window(window, 1)?;
+    if DEBUG_GUI {
+        let window = "robotini";
+        highgui::named_window(window, 1)?;
+    }
 
     let mut frame_i = 0;
     let mut car_state = CarState {
         speed: 0.0,
         wheels_turn: 0.0,
+        previous_horizons: VecDeque::new(),
     };
 
     loop {
         let image = connection.read_next_image()?;
 
-        let mut frame =
+        let frame =
             opencv::imgcodecs::imdecode(&VectorOfu8::from(image), opencv::imgcodecs::IMREAD_COLOR)?;
 
         save_frame(&frame, frame_i)?;
@@ -63,13 +69,11 @@ fn run() -> anyhow::Result<()> {
 
         connection.send(&Command::Forward { value: 0.15 })?;
 
-        if frame.size()?.width > 0 {
-            highgui::imshow(window, &mut frame)?;
-        }
-
-        let key = highgui::wait_key(10)?;
-        if key > 0 && key != 255 {
-            break;
+        if DEBUG_GUI {
+            let key = highgui::wait_key(10)?;
+            if key > 0 && key != 255 {
+                break;
+            }
         }
 
         frame_i += 1;
@@ -80,6 +84,7 @@ fn run() -> anyhow::Result<()> {
 struct CarState {
     wheels_turn: f32,
     speed: f32,
+    previous_horizons: VecDeque<i32>,
 }
 
 fn frame_update(
@@ -92,61 +97,66 @@ fn frame_update(
 
     let frames = process_frame(frame)?;
 
-    let blue_roi = Mat::roi(
-        &frames.get(0).unwrap().1,
-        Rect_ {
-            x: 32,
-            y: 20,
-            width: 64,
-            height: 60,
-        },
-    )
-    .ok()
+    let (horizon_i, _horizon_blackness) = {
+        let filtered = &frames[2].3;
+        let cols = filtered.cols();
+
+        (0..filtered.rows() / 2)
+            .rev()
+            .map(|y| {
+                let row = filtered.at_row::<u8>(y).unwrap();
+                let black_pixel_count = row.iter().filter(|px| **px == 0).count();
+                let fullness = black_pixel_count as f32 / cols as f32;
+                (y, fullness)
+            })
+            .max_by(|(_, fullness_a), (_, fullness_b)| {
+                PartialOrd::partial_cmp(fullness_a, fullness_b).unwrap()
+            })
+    }
     .unwrap();
+
+    state.previous_horizons.push_front(horizon_i);
+    state.previous_horizons.truncate(60);
+    let horizon_interpolated = (state.previous_horizons.iter().sum::<i32>() as f32
+        / state.previous_horizons.len() as f32) as i32;
+
+    let width = frames[0].1.cols();
+    let height = frames[0].1.rows();
+
+    let roi_rect = Rect_ {
+        x: 0,
+        y: horizon_interpolated,
+        width,
+        height: height - horizon_interpolated,
+    };
+
+    let total_pixels = roi_rect.width * roi_rect.height;
+
+    let blue_roi = Mat::roi(&frames.get(0).unwrap().1, roi_rect).ok().unwrap();
     save_frame_to_file("captures/debug/blue-roi.png", &blue_roi)?;
     let blue_count = count_non_zero(&blue_roi).unwrap() as f32;
 
     // calc the green frame and if we should move left
-    let green_roi = Mat::roi(
-        &frames.get(1).unwrap().2,
-        Rect_ {
-            x: 64,
-            y: 20,
-            width: 64,
-            height: 60,
-        },
-    )
-    .ok()
-    .unwrap();
+    let green_roi = Mat::roi(&frames.get(1).unwrap().2, roi_rect).ok().unwrap();
     save_frame_to_file("captures/debug/green-roi.png", &green_roi)?;
     let green_count = count_non_zero(&green_roi).unwrap() as f32;
 
     // calc the red frame and if we should move right
-    let red_roi = Mat::roi(
-        &frames.get(2).unwrap().3,
-        Rect_ {
-            x: 0,
-            y: 20,
-            width: 64,
-            height: 60,
-        },
-    )
-    .ok()
-    .unwrap();
+    let red_roi = Mat::roi(&frames.get(2).unwrap().3, roi_rect).ok().unwrap();
     save_frame_to_file("captures/debug/red-roi.png", &red_roi)?;
     let red_count = count_non_zero(&red_roi).unwrap() as f32;
 
-    let red_ratio = red_count / (64.0 * 60.0);
-    let green_ratio = green_count / (64.0 * 60.0);
-    let blue_ratio = blue_count / (64.0 * 60.0);
+    let red_ratio = red_count / total_pixels as f32;
+    let green_ratio = green_count / total_pixels as f32;
+    let blue_ratio = blue_count / total_pixels as f32;
 
     let diff = red_ratio - green_ratio;
     if blue_ratio < 0.6 {
-        *wheels_turn = (*wheels_turn - diff * 2.0f32).max(-0.9f32).min(0.9f32);
+        *wheels_turn = (*wheels_turn - diff * 1.8f32).max(-0.9f32).min(0.9f32);
     }
-    let max_speed = 0.15;
-    let min_speed = 0.06;
-    *speed = (0.01 / wheels_turn.abs().max(0.01))
+    let max_speed = 0.03;
+    let min_speed = 0.002;
+    *speed = (0.001 / wheels_turn.abs().max(0.01))
         .min(max_speed)
         .max(min_speed);
 
@@ -156,6 +166,28 @@ fn frame_update(
     })?;
 
     *wheels_turn *= 0.3;
+
+    let mut viz_frame = frame.clone();
+
+    if DEBUG_GUI {
+        opencv::imgproc::line(
+            &mut viz_frame,
+            Point_ {
+                x: 0,
+                y: horizon_interpolated,
+            },
+            Point_ {
+                x: 200,
+                y: horizon_interpolated,
+            },
+            Scalar_([0.0, 0.0, 1.0, 0.0]),
+            1,
+            LINE_8,
+            0,
+        )?;
+
+        highgui::imshow("robotini", &viz_frame)?;
+    }
 
     Ok(())
 }
@@ -242,13 +274,13 @@ fn process_frame(frame: &Mat) -> anyhow::Result<Vec<(Mat, Mat, Mat, Mat)>> {
 
             // 100 is good for red, blue and green is good with 120
             let mut rred = c.clone();
-            threshold(&r, &mut rred, 200.0, 255.0, THRESH_BINARY).unwrap();
+            threshold(&r, &mut rred, 150.0, 255.0, THRESH_BINARY).unwrap();
 
             let mut rgreen = c.clone();
             threshold(&r, &mut rgreen, 200.0, 255.0, THRESH_BINARY).unwrap();
 
             let mut rblue = c.clone();
-            threshold(&r, &mut rblue, 225.0, 255.0, THRESH_BINARY).unwrap();
+            threshold(&r, &mut rblue, 200.0, 255.0, THRESH_BINARY).unwrap();
 
             (r, rblue, rgreen, rred)
         })
